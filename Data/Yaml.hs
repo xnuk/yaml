@@ -59,11 +59,16 @@ module Data.Yaml
     , encode
     , encodeFile
     , decode
+    , decodeFailsafe
     , decodeFile
+    , decodeFileFailsafe
       -- ** Better error information
     , decodeEither
+    , decodeEitherFailsafe
     , decodeEither'
+    , decodeEitherFailsafe'
     , decodeFileEither
+    , decodeFileEitherFailsafe
       -- ** More control over decoding
     , decodeHelper
     ) where
@@ -71,6 +76,8 @@ module Data.Yaml
 import Control.Applicative((<$>))
 #endif
 import Control.Exception
+import Control.Monad.Trans.State (StateT)
+import Control.Monad.Trans.Resource (ResourceT)
 import Data.Aeson
     ( Value (..), ToJSON (..), FromJSON (..), object
     , (.=) , (.:) , (.:?) , (.!=)
@@ -84,10 +91,11 @@ import Data.Aeson.Encode (encodeToTextBuilder)
 #endif
 import Data.Aeson.Types (Pair, parseMaybe, parseEither, Parser)
 import Data.ByteString (ByteString)
-import Data.Conduit ((.|), runConduitRes)
+import Data.Conduit ((.|), ConduitM, runConduitRes)
 import qualified Data.Conduit.List as CL
 import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as HashSet
+import qualified Data.Map as Map
 import Data.Text.Encoding (encodeUtf8)
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Lazy as TL
@@ -95,7 +103,8 @@ import Data.Text.Lazy.Builder (toLazyText)
 import qualified Data.Vector as V
 import System.IO.Unsafe (unsafePerformIO)
 
-import Data.Yaml.Internal
+import Data.Yaml.Internal hiding (decodeHelper)
+import qualified Data.Yaml.Internal as YI
 import Text.Libyaml hiding (encode, decode, encodeFile, decodeFile)
 import qualified Text.Libyaml as Y
 
@@ -154,40 +163,85 @@ pairToEvents (k, v) rest =
     EventScalar (encodeUtf8 k) StrTag PlainNoTag Nothing
   : objToEvents' v rest
 
-decode :: FromJSON a
-       => ByteString
-       -> Maybe a
-decode bs = unsafePerformIO
-          $ either (const Nothing) id
-          <$> decodeHelper_ (Y.decode bs)
 
-decodeFile :: FromJSON a
-           => FilePath
-           -> IO (Maybe a)
-decodeFile fp = decodeHelper (Y.decodeFile fp) >>= either throwIO (return . either (const Nothing) id)
+decodeWithSchema :: FromJSON a
+                 => Schema
+                 -> ByteString
+                 -> Maybe a
+decodeWithSchema schema bs = unsafePerformIO
+                    $ either (const Nothing) id
+                    <$> decodeHelper_ schema (Y.decode bs)
+
+decode, decodeFailsafe :: FromJSON a => ByteString -> Maybe a
+decode = decodeWithSchema OtherSchema
+
+-- | Same as 'decode' but treat scalar value as just string-like value instead.
+--
+-- > -- Just "version: 1.1\n"
+-- > fmap encode (decode "version: 1.10" :: Maybe Value)
+-- >
+-- > -- Just "version: '1.10'\n"
+-- > fmap encode (decodeFailsafe  "version: 1.10" :: Maybe Value)
+decodeFailsafe = decodeWithSchema Failsafe
+
+
+decodeFileWithSchema :: FromJSON a
+                     => Schema
+                     -> FilePath
+                     -> IO (Maybe a)
+decodeFileWithSchema schema fp = YI.decodeHelper schema (Y.decodeFile fp) >>= either throwIO (return . either (const Nothing) id)
+
+decodeFile, decodeFileFailsafe :: FromJSON a => FilePath -> IO (Maybe a)
+decodeFile = decodeFileWithSchema OtherSchema
+decodeFileFailsafe = decodeFileWithSchema Failsafe
+
+
+decodeFileEitherWithSchema
+    :: FromJSON a
+    => Schema
+    -> FilePath
+    -> IO (Either ParseException a)
+decodeFileEitherWithSchema schema = decodeHelper_ schema . Y.decodeFile
 
 -- | A version of 'decodeFile' which should not throw runtime exceptions.
 --
 -- Since 0.8.4
-decodeFileEither
+decodeFileEither, decodeFileEitherFailsafe
     :: FromJSON a
     => FilePath
     -> IO (Either ParseException a)
-decodeFileEither = decodeHelper_ . Y.decodeFile
+decodeFileEither = decodeFileEitherWithSchema OtherSchema
+decodeFileEitherFailsafe = decodeFileEitherWithSchema Failsafe
 
-decodeEither :: FromJSON a => ByteString -> Either String a
-decodeEither bs = unsafePerformIO
+
+decodeEitherWithSchema :: FromJSON a => Schema -> ByteString -> Either String a
+decodeEitherWithSchema schema bs = unsafePerformIO
                 $ either (Left . prettyPrintParseException) id
-                <$> decodeHelper (Y.decode bs)
+                <$> YI.decodeHelper schema (Y.decode bs)
+
+decodeEither, decodeEitherFailsafe :: FromJSON a => ByteString -> Either String a
+decodeEither = decodeEitherWithSchema OtherSchema
+decodeEitherFailsafe = decodeEitherWithSchema Failsafe
+
+
+decodeEitherWithSchema' :: FromJSON a => Schema -> ByteString -> Either ParseException a
+decodeEitherWithSchema' schema = either Left (either (Left . AesonException) Right)
+              . unsafePerformIO
+              . YI.decodeHelper schema
+              . Y.decode
 
 -- | More helpful version of 'decodeEither' which returns the 'YamlException'.
 --
 -- Since 0.8.3
-decodeEither' :: FromJSON a => ByteString -> Either ParseException a
-decodeEither' = either Left (either (Left . AesonException) Right)
-              . unsafePerformIO
-              . decodeHelper
-              . Y.decode
+decodeEither', decodeEitherFailsafe' :: FromJSON a => ByteString -> Either ParseException a
+decodeEither' = decodeEitherWithSchema' OtherSchema
+decodeEitherFailsafe' = decodeEitherWithSchema' Failsafe
+
+
+decodeHelper :: FromJSON a
+             => ConduitM () Event (StateT (Map.Map String Value) (ResourceT IO)) ()
+             -> IO (Either ParseException (Either String a))
+decodeHelper = YI.decodeHelper OtherSchema
 
 array :: [Value] -> Value
 array = Array . V.fromList

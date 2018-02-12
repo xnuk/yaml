@@ -20,7 +20,7 @@ import Data.Text.Encoding (decodeUtf8)
 import System.Directory
 import System.FilePath
 
-import Data.Yaml.Internal (ParseException(..), decodeHelper_, decodeHelper)
+import Data.Yaml.Internal (ParseException(..), Schema(..), decodeHelper_, decodeHelper)
 import Text.Libyaml hiding (decodeFile)
 import qualified Text.Libyaml as Y
 
@@ -65,7 +65,7 @@ decodeFile
     :: FromJSON a
     => FilePath
     -> IO (Maybe a)
-decodeFile fp = decodeHelper (eventsFromFile fp) >>= either throwIO (return . either (const Nothing) id)
+decodeFile fp = decodeHelper OtherSchema (eventsFromFile fp) >>= either throwIO (return . either (const Nothing) id)
 
 -- | Like `Data.Yaml.decodeFileEither` but with support for relative and
 -- absolute includes.
@@ -77,4 +77,4 @@ decodeFileEither
     :: FromJSON a
     => FilePath
     -> IO (Either ParseException a)
-decodeFileEither = decodeHelper_ . eventsFromFile
+decodeFileEither = decodeHelper_ OtherSchema . eventsFromFile

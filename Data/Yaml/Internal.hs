@@ -5,6 +5,7 @@
 module Data.Yaml.Internal
     (
       ParseException(..)
+    , Schema(..)
     , prettyPrintParseException
     , parse
     , decodeHelper
@@ -54,6 +55,12 @@ data ParseException = NonScalarKey
                     | NonStringKeyAlias Y.AnchorName Value
                     | CyclicIncludes
     deriving (Show, Typeable)
+
+data Schema = Failsafe
+--          | JSON
+--          | Core
+            | OtherSchema
+    deriving (Show, Eq)
 
 instance Exception ParseException where
 #if MIN_VERSION_base(4, 8, 0)
@@ -130,8 +137,8 @@ requireEvent e = do
     f <- CL.head
     unless (f == Just e) $ liftIO $ throwIO $ UnexpectedEvent f $ Just e
 
-parse :: ConduitM Event o Parse Value
-parse = do
+parse :: Schema -> ConduitM Event o Parse Value
+parse schema = do
     streamStart <- CL.head
     case streamStart of
         Nothing ->
@@ -144,29 +151,30 @@ parse = do
                     -- empty file input, comment only string/file input
                     return Null
                 Just EventDocumentStart -> do
-                    res <- parseO
+                    res <- parseO schema
                     requireEvent EventDocumentEnd
                     requireEvent EventStreamEnd
                     return res
                 _ -> liftIO $ throwIO $ UnexpectedEvent documentStart Nothing
         _ -> liftIO $ throwIO $ UnexpectedEvent streamStart Nothing
 
-parseScalar :: ByteString -> Anchor -> Style -> Tag
+parseScalar :: Schema -> ByteString -> Anchor -> Style -> Tag
             -> ConduitM Event o Parse Text
-parseScalar v a style tag = do
+parseScalar schema v a style tag = do
     let res = decodeUtf8With lenientDecode v
     case a of
         Nothing -> return res
         Just an -> do
-            lift $ modify (Map.insert an $ textToValue style tag res)
+            lift $ modify (Map.insert an $ textToValue schema style tag res)
             return res
 
-textToValue :: Style -> Tag -> Text -> Value
-textToValue SingleQuoted _ t = String t
-textToValue DoubleQuoted _ t = String t
-textToValue _ StrTag t = String t
-textToValue Folded _ t = String t
-textToValue _ _ t
+textToValue :: Schema -> Style -> Tag -> Text -> Value
+textToValue Failsafe _ _ t = String t
+textToValue _ SingleQuoted _ t = String t
+textToValue _ DoubleQuoted _ t = String t
+textToValue _ _ StrTag t = String t
+textToValue _ Folded _ t = String t
+textToValue OtherSchema _ _ t
     | t `elem` ["null", "Null", "NULL", "~", ""] = Null
     | any (t `isLike`) ["y", "yes", "on", "true"] = Bool True
     | any (t `isLike`) ["n", "no", "off", "false"] = Bool False
@@ -178,13 +186,14 @@ textToValue _ _ t
 textToScientific :: Text -> Either String Scientific
 textToScientific = Atto.parseOnly (Atto.scientific <* Atto.endOfInput)
 
-parseO :: ConduitM Event o Parse Value
-parseO = do
+parseO :: Schema -> ConduitM Event o Parse Value
+parseO schema = do
     me <- CL.head
     case me of
-        Just (EventScalar v tag style a) -> textToValue style tag <$> parseScalar v a style tag
-        Just (EventSequenceStart a) -> parseS a id
-        Just (EventMappingStart a) -> parseM a M.empty
+        Just (EventScalar v tag style a) ->
+            textToValue schema style tag <$> parseScalar schema v a style tag
+        Just (EventSequenceStart a) -> parseS schema a id
+        Just (EventMappingStart a) -> parseM schema a M.empty
         Just (EventAlias an) -> do
             m <- lift get
             case Map.lookup an m of
@@ -192,10 +201,11 @@ parseO = do
                 Just v -> return v
         _ -> liftIO $ throwIO $ UnexpectedEvent me Nothing
 
-parseS :: Y.Anchor
+parseS :: Schema
+       -> Y.Anchor
        -> ([Value] -> [Value])
        -> ConduitM Event o Parse Value
-parseS a front = do
+parseS schema a front = do
     me <- CL.peek
     case me of
         Just EventSequenceEnd -> do
@@ -207,13 +217,14 @@ parseS a front = do
                     lift $ modify $ Map.insert an res
                     return res
         _ -> do
-            o <- parseO
-            parseS a $ front . (:) o
+            o <- parseO schema
+            parseS schema a $ front . (:) o
 
-parseM :: Y.Anchor
+parseM :: Schema
+       -> Y.Anchor
        -> M.HashMap Text Value
        -> ConduitM Event o Parse Value
-parseM a front = do
+parseM schema a front = do
     me <- CL.peek
     case me of
         Just EventMappingEnd -> do
@@ -227,7 +238,7 @@ parseM a front = do
         _ -> do
             CL.drop 1
             s <- case me of
-                    Just (EventScalar v tag style a') -> parseScalar v a' style tag
+                    Just (EventScalar v tag style a') -> parseScalar schema v a' style tag
                     Just (EventAlias an) -> do
                         m <- lift get
                         case Map.lookup an m of
@@ -235,7 +246,7 @@ parseM a front = do
                             Just (String t) -> return t
                             Just v -> liftIO $ throwIO $ NonStringKeyAlias an v
                     _ -> liftIO $ throwIO $ UnexpectedEvent me Nothing
-            o <- parseO
+            o <- parseO schema
 
             let al  = M.insert s o front
                 al' = if s == pack "<<"
@@ -244,18 +255,19 @@ parseM a front = do
                                   Array l -> M.union front $ foldl merge' M.empty $ V.toList l
                                   _          -> al
                          else al
-            parseM a al'
+            parseM schema a al'
     where merge' al (Object om) = M.union al om
           merge' al _           = al
 
 decodeHelper :: FromJSON a
-             => ConduitM () Y.Event Parse ()
-             -> IO (Either ParseException (Either String a))
-decodeHelper src = do
+                   => Schema
+                   -> ConduitM () Y.Event Parse ()
+                   -> IO (Either ParseException (Either String a))
+decodeHelper schema src = do
     -- This used to be tryAny, but the fact is that catching async
     -- exceptions is fine here. We'll rethrow them immediately in the
     -- otherwise clause.
-    x <- try $ runResourceT $ flip evalStateT Map.empty $ runConduit $ src .| parse
+    x <- try $ runResourceT $ flip evalStateT Map.empty $ runConduit $ src .| parse schema
     case x of
         Left e
             | Just pe <- fromException e -> return $ Left pe
@@ -264,10 +276,11 @@ decodeHelper src = do
         Right y -> return $ Right $ parseEither parseJSON y
 
 decodeHelper_ :: FromJSON a
-              => ConduitM () Event Parse ()
-              -> IO (Either ParseException a)
-decodeHelper_ src = do
-    x <- try $ runResourceT $ flip evalStateT Map.empty $ runConduit $ src .| parse
+                    => Schema
+                    -> ConduitM () Event Parse ()
+                    -> IO (Either ParseException a)
+decodeHelper_ schema src = do
+    x <- try $ runResourceT $ flip evalStateT Map.empty $ runConduit $ src .| parse schema
     return $ case x of
         Left e
             | Just pe <- fromException e -> Left pe
