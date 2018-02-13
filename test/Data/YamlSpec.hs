@@ -161,6 +161,10 @@ spec = do
 
     it "truncates files" caseTruncatesFiles
 
+    describe "failsafe schema" $ do
+        it "decodeFailsafe" $ do
+            D.decodeFailsafe (B8.pack "foo: 1.10") `shouldBe` Just (object ["foo" .= ("1.10" :: String)])
+
 
 specialStrings :: [T.Text]
 specialStrings =
